@@ -168,7 +168,7 @@ func scanPath(domain string) bool {
 		},
 	}
 
-	finalDomain, _, err := followRedirect(client, domain) 
+	finalDomain, _, err := followRedirect(client, domain) // Removed unused statusCode
 	if err != nil {
 		color.Red("\t\t\t\t[+] Error following redirects: %v", err)
 		return false
@@ -186,7 +186,7 @@ func scanPath(domain string) bool {
 	for _, path := range paths {
 		targetURL := parsedDomain.Scheme + "://" + parsedDomain.Host + path
 
-		finalURL, _, err := followRedirect(client, targetURL) // Removed unused statusCode
+		finalURL, _, err := followRedirect(client, targetURL)
 		if err != nil {
 			fmt.Printf("\t\t\t\t[+] path %-40s| 400 error\n", path)
 			continue
