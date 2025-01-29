@@ -9,7 +9,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
 	"github.com/fatih/color"
 )
 
@@ -168,7 +167,7 @@ func scanPath(domain string) bool {
 		},
 	}
 
-	finalDomain, _, err := followRedirect(client, domain) // Removed unused statusCode
+	finalDomain, _, err := followRedirect(client, domain)
 	if err != nil {
 		color.Red("\t\t\t\t[+] Error following redirects: %v", err)
 		return false
