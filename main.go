@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"time"
+
 	"github.com/fatih/color"
 )
 
@@ -48,62 +49,45 @@ var vulnerabilitySigns = []string{
 }
 
 func isHTML(responseText string) bool {
-	return strings.Contains(strings.ToLower(responseText), "<html") ||
-		strings.Contains(strings.ToLower(responseText), "<!doctype html")
+	lowerText := strings.ToLower(responseText)
+	return strings.Contains(lowerText, "<html") || strings.Contains(lowerText, "<!doctype html")
 }
 
 func formatStatus(code int) string {
-	switch code {
-	case 200:
-		return "200 vulnerable!"
-	case 301:
-		return "301 moved permanently"
-	case 302:
-		return "302 redirect"
-	case 303:
-		return "303 see other"
-	case 304:
-		return "304 not modified"
-	case 307:
-		return "307 temporary redirect"
-	case 308:
-		return "308 permanent redirect"
-	case 400:
-		return "400 error"
-	case 401:
-		return "401 unauthorized"
-	case 403:
-		return "403 forbidden"
-	case 404:
-		return "404 not found"
-	case 405:
-		return "405 method not allowed"
-	case 406:
-		return "406 not acceptable"
-	case 407:
-		return "407 proxy auth required"
-	case 408:
-		return "408 request timeout"
-	case 429:
-		return "429 too many requests"
-	case 500:
-		return "500 server error"
-	case 501:
-		return "501 not implemented"
-	case 502:
-		return "502 bad gateway"
-	case 503:
-		return "503 service unavailable"
-	case 504:
-		return "504 gateway timeout"
-	default:
-		return fmt.Sprintf("%d unknown status", code)
+	statusMessages := map[int]string{
+		200: "200 vulnerable!",
+		301: "301 moved permanently",
+		302: "302 redirect",
+		303: "303 see other",
+		304: "304 not modified",
+		307: "307 temporary redirect",
+		308: "308 permanent redirect",
+		400: "400 error",
+		401: "401 unauthorized",
+		403: "403 forbidden",
+		404: "404 not found",
+		405: "405 method not allowed",
+		406: "406 not acceptable",
+		407: "407 proxy auth required",
+		408: "408 request timeout",
+		429: "429 too many requests",
+		500: "500 server error",
+		501: "501 not implemented",
+		502: "502 bad gateway",
+		503: "503 service unavailable",
+		504: "504 gateway timeout",
 	}
+
+	if msg, exists := statusMessages[code]; exists {
+		return msg
+	}
+	return fmt.Sprintf("%d unknown status", code)
 }
 
 func checkVulnerability(content string) bool {
+	lowerContent := strings.ToLower(content)
 	for _, sign := range vulnerabilitySigns {
-		if strings.Contains(strings.ToLower(content), strings.ToLower(sign)) {
+		if strings.Contains(lowerContent, strings.ToLower(sign)) {
 			return true
 		}
 	}
@@ -142,7 +126,7 @@ func followRedirect(client *http.Client, initialURL string) (string, int, error)
 		}
 
 		currentURL = resp.Request.URL.ResolveReference(nextURL).String()
-		color.Yellow("\t\t\t\t[+] Following redirect to: %s", currentURL)
+		color.Yellow("\t[+] Following redirect to: %s", currentURL)
 	}
 
 	return currentURL, 0, fmt.Errorf("too many redirects")
@@ -167,14 +151,15 @@ func scanPath(domain string) bool {
 		},
 	}
 
-	finalDomain, _, err := followRedirect(client, domain)
+	finalDomain, statusCode, err := followRedirect(client, domain)
 	if err != nil {
-		color.Red("\t\t\t\t[+] Error following redirects: %v", err)
+		color.Red("\t[+] Error following redirects: %v", err)
 		return false
 	}
 
+	color.Cyan("\t[+] Final domain: %s (Status: %s)", finalDomain, formatStatus(statusCode))
+
 	if finalDomain != domain {
-		color.Yellow("\t\t\t\t[+] Domain redirects to: %s", finalDomain)
 		parsedDomain, err = url.Parse(finalDomain)
 		if err != nil {
 			return false
@@ -185,15 +170,15 @@ func scanPath(domain string) bool {
 	for _, path := range paths {
 		targetURL := parsedDomain.Scheme + "://" + parsedDomain.Host + path
 
-		finalURL, _, err := followRedirect(client, targetURL)
+		finalURL, statusCode, err := followRedirect(client, targetURL)
 		if err != nil {
-			fmt.Printf("\t\t\t\t[+] path %-40s| 400 error\n", path)
+			fmt.Printf("\t[+] path %-40s| 400 error\n", path)
 			continue
 		}
 
 		req, err := http.NewRequest("GET", finalURL, nil)
 		if err != nil {
-			fmt.Printf("\t\t\t\t[+] path %-40s| 400 error\n", path)
+			fmt.Printf("\t[+] path %-40s| 400 error\n", path)
 			continue
 		}
 
@@ -201,44 +186,29 @@ func scanPath(domain string) bool {
 		resp, err := client.Do(req)
 
 		if err != nil {
-			if strings.Contains(err.Error(), "timeout") ||
-				strings.Contains(err.Error(), "deadline exceeded") {
-				fmt.Printf("\t\t\t\t[+] path %-40s| 400 error\n", path)
-			} else {
-				fmt.Printf("\t\t\t\t[+] path %-40s| 400 error\n", path)
-			}
+			fmt.Printf("\t[+] path %-40s| 400 error\n", path)
 			continue
 		}
+		defer resp.Body.Close()
 
-		if resp != nil {
-			defer resp.Body.Close()
-
-			if resp.StatusCode == 200 {
-				bodyBytes, err := io.ReadAll(resp.Body)
-				if err != nil {
-					fmt.Printf("\t\t\t\t[+] path %-40s| 400 error\n", path)
-					continue
-				}
-
-				content := string(bodyBytes)
-				if isHTML(content) {
-					fmt.Printf("\t\t\t\t[+] path %-40s| 404 not found\n", path)
-				} else if checkVulnerability(content) {
-					color.Green("\t\t\t\t[+] path %-40s| %s", path, formatStatus(resp.StatusCode))
-					vulnerable = true
-				} else {
-					fmt.Printf("\t\t\t\t[+] path %-40s| 404 not found\n", path)
-				}
-			} else {
-				switch {
-				case resp.StatusCode >= 300 && resp.StatusCode < 400:
-					color.Yellow("\t\t\t\t[+] path %-40s| %s", path, formatStatus(resp.StatusCode))
-				case resp.StatusCode >= 400 && resp.StatusCode < 500:
-					color.Red("\t\t\t\t[+] path %-40s| %s", path, formatStatus(resp.StatusCode))
-				case resp.StatusCode >= 500:
-					color.Red("\t\t\t\t[+] path %-40s| %s", path, formatStatus(resp.StatusCode))
-				}
+		if resp.StatusCode == 200 {
+			bodyBytes, err := io.ReadAll(resp.Body)
+			if err != nil {
+				fmt.Printf("\t[+] path %-40s| 400 error\n", path)
+				continue
 			}
+
+			content := string(bodyBytes)
+			if isHTML(content) {
+				fmt.Printf("\t[+] path %-40s| 404 not found\n", path)
+			} else if checkVulnerability(content) {
+				color.Green("\t[+] path %-40s| %s", path, formatStatus(resp.StatusCode))
+				vulnerable = true
+			} else {
+				fmt.Printf("\t[+] path %-40s| 404 not found\n", path)
+			}
+		} else {
+			color.Yellow("\t[+] path %-40s| %s", path, formatStatus(resp.StatusCode))
 		}
 	}
 	return vulnerable
@@ -261,10 +231,8 @@ func main() {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		domain := strings.TrimSpace(scanner.Text())
-		if domain != "" {
-			if scanPath(domain) {
-				vulnerableDomains = append(vulnerableDomains, domain)
-			}
+		if domain != "" && scanPath(domain) {
+			vulnerableDomains = append(vulnerableDomains, domain)
 		}
 	}
 
