@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
-	"net/url"
-	"github.com/fatih/color"
 	"time"
+
+	"github.com/fatih/color"
 )
 
 var paths = []string{
@@ -29,8 +30,8 @@ var paths = []string{
 }
 
 var vulnerabilitySigns = []string{
-	"ref:", 
-	"index of", 
+	"ref:",
+	"index of",
 	"initial commit",
 	"update by push",
 	"[core]",
@@ -48,8 +49,8 @@ var vulnerabilitySigns = []string{
 }
 
 func isHTML(responseText string) bool {
-	return strings.Contains(strings.ToLower(responseText), "<html") || 
-		   strings.Contains(strings.ToLower(responseText), "<!doctype html")
+	return strings.Contains(strings.ToLower(responseText), "<html") ||
+		strings.Contains(strings.ToLower(responseText), "<!doctype html")
 }
 
 func formatStatus(code int) string {
@@ -113,38 +114,38 @@ func checkVulnerability(content string) bool {
 func followRedirect(client *http.Client, initialURL string) (string, int, error) {
 	maxRedirects := 10
 	currentURL := initialURL
-	
+
 	for i := 0; i < maxRedirects; i++ {
 		req, err := http.NewRequest("GET", currentURL, nil)
 		if err != nil {
 			return "", 0, err
 		}
-		
+
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0")
 		resp, err := client.Do(req)
 		if err != nil {
 			return "", 0, err
 		}
 		defer resp.Body.Close()
-		
+
 		if resp.StatusCode < 300 || resp.StatusCode >= 400 {
 			return currentURL, resp.StatusCode, nil
 		}
-		
+
 		location := resp.Header.Get("Location")
 		if location == "" {
 			return currentURL, resp.StatusCode, nil
 		}
-		
+
 		nextURL, err := url.Parse(location)
 		if err != nil {
 			return "", 0, err
 		}
-		
+
 		currentURL = resp.Request.URL.ResolveReference(nextURL).String()
 		color.Yellow("\t\t\t\t[+] Following redirect to: %s", currentURL)
 	}
-	
+
 	return currentURL, 0, fmt.Errorf("too many redirects")
 }
 
@@ -167,7 +168,7 @@ func scanPath(domain string) bool {
 		},
 	}
 
-	finalDomain, statusCode, err := followRedirect(client, domain)
+	finalDomain, _, err := followRedirect(client, domain) 
 	if err != nil {
 		color.Red("\t\t\t\t[+] Error following redirects: %v", err)
 		return false
@@ -184,8 +185,8 @@ func scanPath(domain string) bool {
 	vulnerable := false
 	for _, path := range paths {
 		targetURL := parsedDomain.Scheme + "://" + parsedDomain.Host + path
-		
-		finalURL, statusCode, err := followRedirect(client, targetURL)
+
+		finalURL, _, err := followRedirect(client, targetURL) // Removed unused statusCode
 		if err != nil {
 			fmt.Printf("\t\t\t\t[+] path %-40s| 400 error\n", path)
 			continue
@@ -199,10 +200,10 @@ func scanPath(domain string) bool {
 
 		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; GitSD/1.0)")
 		resp, err := client.Do(req)
-		
+
 		if err != nil {
 			if strings.Contains(err.Error(), "timeout") ||
-			   strings.Contains(err.Error(), "deadline exceeded") {
+				strings.Contains(err.Error(), "deadline exceeded") {
 				fmt.Printf("\t\t\t\t[+] path %-40s| 400 error\n", path)
 			} else {
 				fmt.Printf("\t\t\t\t[+] path %-40s| 400 error\n", path)
@@ -212,7 +213,7 @@ func scanPath(domain string) bool {
 
 		if resp != nil {
 			defer resp.Body.Close()
-			
+
 			if resp.StatusCode == 200 {
 				bodyBytes, err := io.ReadAll(resp.Body)
 				if err != nil {
