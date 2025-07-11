@@ -2,246 +2,163 @@ package main
 
 import (
 	"bufio"
-	"fmt"
-	"io"
-	"net/http"
-	"net/url"
+	"flag"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fatih/color"
 )
 
-var paths = []string{
-	"/.git/",
-	"/.git/index",
-	"/.git/logs/",
-	"/.git/HEAD",
-	"/.git/logs/HEAD",
-	"/.git/logs/refs",
-	"/.git/logs/refs/remotes/origin/master",
-	"/.git/config",
-	"/.git/description",
-	"/.git/hooks/",
-	"/.git/info/",
-	"/.git/objects/",
-	"/.git/refs/",
-}
-
-var vulnerabilitySigns = []string{
-	"ref:",
-	"index of",
-	"initial commit",
-	"update by push",
-	"[core]",
-	"repository",
-	"bare = false",
-	"filemode",
-	"[remote",
-	"[branch",
-	"master",
-	"origin",
-	"HEAD branch:",
-	"refs/heads/",
-	"autopull",
-	"repositoryformatversion",
-}
-
-func isHTML(responseText string) bool {
-	lowerText := strings.ToLower(responseText)
-	return strings.Contains(lowerText, "<html") || strings.Contains(lowerText, "<!doctype html")
-}
-
-func formatStatus(code int) string {
-	statusMessages := map[int]string{
-		200: "200 vulnerable!",
-		301: "301 moved permanently",
-		302: "302 redirect",
-		303: "303 see other",
-		304: "304 not modified",
-		307: "307 temporary redirect",
-		308: "308 permanent redirect",
-		400: "400 error",
-		401: "401 unauthorized",
-		403: "403 forbidden",
-		404: "404 not found",
-		405: "405 method not allowed",
-		406: "406 not acceptable",
-		407: "407 proxy auth required",
-		408: "408 request timeout",
-		429: "429 too many requests",
-		500: "500 server error",
-		501: "501 not implemented",
-		502: "502 bad gateway",
-		503: "503 service unavailable",
-		504: "504 gateway timeout",
-	}
-
-	if msg, exists := statusMessages[code]; exists {
-		return msg
-	}
-	return fmt.Sprintf("%d unknown status", code)
-}
-
-func checkVulnerability(content string) bool {
-	lowerContent := strings.ToLower(content)
-	for _, sign := range vulnerabilitySigns {
-		if strings.Contains(lowerContent, strings.ToLower(sign)) {
-			return true
-		}
-	}
-	return false
-}
-
-func followRedirect(client *http.Client, initialURL string) (string, int, error) {
-	maxRedirects := 10
-	currentURL := initialURL
-
-	for i := 0; i < maxRedirects; i++ {
-		req, err := http.NewRequest("GET", currentURL, nil)
-		if err != nil {
-			return "", 0, err
-		}
-
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0")
-		resp, err := client.Do(req)
-		if err != nil {
-			return "", 0, err
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode < 300 || resp.StatusCode >= 400 {
-			return currentURL, resp.StatusCode, nil
-		}
-
-		location := resp.Header.Get("Location")
-		if location == "" {
-			return currentURL, resp.StatusCode, nil
-		}
-
-		nextURL, err := url.Parse(location)
-		if err != nil {
-			return "", 0, err
-		}
-
-		currentURL = resp.Request.URL.ResolveReference(nextURL).String()
-		color.Yellow("\t[+] Following redirect to: %s", currentURL)
-	}
-
-	return currentURL, 0, fmt.Errorf("too many redirects")
-}
-
-func scanPath(domain string) bool {
-	if !strings.HasPrefix(domain, "http://") && !strings.HasPrefix(domain, "https://") {
-		domain = "http://" + domain
-	}
-
-	parsedDomain, err := url.Parse(domain)
-	if err != nil {
-		return false
-	}
-
-	color.White("[+] %s", domain)
-
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-
-	finalDomain, statusCode, err := followRedirect(client, domain)
-	if err != nil {
-		color.Red("\t[+] Error following redirects: %v", err)
-		return false
-	}
-
-	color.Cyan("\t[+] Final domain: %s (Status: %s)", finalDomain, formatStatus(statusCode))
-
-	if finalDomain != domain {
-		parsedDomain, err = url.Parse(finalDomain)
-		if err != nil {
-			return false
-		}
-	}
-
-	vulnerable := false
-	for _, path := range paths {
-		targetURL := parsedDomain.Scheme + "://" + parsedDomain.Host + path
-
-		finalURL, statusCode, err := followRedirect(client, targetURL)
-		if err != nil {
-			fmt.Printf("\t[+] path %-40s| 400 error\n", path)
-			continue
-		}
-
-		req, err := http.NewRequest("GET", finalURL, nil)
-		if err != nil {
-			fmt.Printf("\t[+] path %-40s| 400 error\n", path)
-			continue
-		}
-
-		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; GitSD/1.0)")
-		resp, err := client.Do(req)
-
-		if err != nil {
-			fmt.Printf("\t[+] path %-40s| 400 error\n", path)
-			continue
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode == 200 {
-			bodyBytes, err := io.ReadAll(resp.Body)
-			if err != nil {
-				fmt.Printf("\t[+] path %-40s| 400 error\n", path)
-				continue
-			}
-
-			content := string(bodyBytes)
-			if isHTML(content) {
-				fmt.Printf("\t[+] path %-40s| 404 not found\n", path)
-			} else if checkVulnerability(content) {
-				color.Green("\t[+] path %-40s| %s", path, formatStatus(resp.StatusCode))
-				vulnerable = true
-			} else {
-				fmt.Printf("\t[+] path %-40s| 404 not found\n", path)
-			}
-		} else {
-			color.Yellow("\t[+] path %-40s| %s", path, formatStatus(resp.StatusCode))
-		}
-	}
-	return vulnerable
-}
-
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: gitsd <file containing list of domains>")
+	var config Config
+	var pathPrefixesStr string
+	var showHelp bool
+
+	flag.StringVar(&config.ForceProtocol, "f", "", "Force protocol (http/https/http1.1/http2.0)")
+	flag.StringVar(&config.ForceProtocol, "force", "", "Force protocol (http/https/http1.1/http2.0)")
+	flag.StringVar(&pathPrefixesStr, "p", "", "Custom path prefixes (comma-separated)")
+	flag.StringVar(&pathPrefixesStr, "paths", "", "Custom path prefixes (comma-separated)")
+	flag.StringVar(&config.OutputFile, "o", "", "Output file")
+	flag.StringVar(&config.OutputFile, "output", "", "Output file")
+	flag.IntVar(&config.Threads, "t", 10, "Number of concurrent threads")
+	flag.IntVar(&config.Threads, "threads", 10, "Number of concurrent threads")
+	flag.BoolVar(&config.DebugMode, "d", false, "Enable debug mode")
+	flag.BoolVar(&config.DebugMode, "debug", false, "Enable debug mode")
+	flag.BoolVar(&showHelp, "h", false, "Show help")
+	flag.BoolVar(&showHelp, "help", false, "Show help")
+	flag.Parse()
+
+	if showHelp || len(flag.Args()) < 1 {
+		printUsage()
+		return
+	}
+	config.Filename = flag.Args()[0]
+
+	validProtocols := map[string]bool{
+		"http": true, "https": true, "http1.1": true, "http2.0": true,
+	}
+	if config.ForceProtocol != "" && !validProtocols[strings.ToLower(config.ForceProtocol)] {
+		color.Red("Error: Force protocol must be 'http', 'https', 'http1.1', or 'http2.0'")
 		return
 	}
 
-	file, err := os.Open(os.Args[1])
+	if pathPrefixesStr != "" {
+		prefixes := strings.Split(pathPrefixesStr, ",")
+		config.PathPrefixes = make([]string, 0, len(prefixes))
+		for _, prefix := range prefixes {
+			trimmed := strings.TrimSpace(prefix)
+			if trimmed != "" {
+				sanitized := sanitizePrefix(trimmed)
+				if sanitized != "" {
+					config.PathPrefixes = append(config.PathPrefixes, sanitized)
+				}
+			}
+		}
+	}
+
+	writer, err := NewOutputWriter(config.OutputFile)
 	if err != nil {
-		fmt.Println("Error opening file:", err)
+		color.Red("Error creating output file: %v", err)
+		return
+	}
+	defer writer.Close()
+
+	file, err := os.Open(config.Filename)
+	if err != nil {
+		color.Red("Error opening file: %v", err)
 		return
 	}
 	defer file.Close()
 
-	var vulnerableDomains []string
+	printHeader(writer)
+	basePaths, customPaths := buildPaths(&config)
+	stats := ScanStats{
+		TotalDomains: 0,
+		BasePaths:    len(basePaths),
+		CustomPaths:  len(customPaths),
+		StartTime:    time.Now(),
+	}
+
+	writer.WriteColor(color.New(color.FgCyan), "Configuration:\n")
+	if config.ForceProtocol != "" {
+		writer.WriteColor(color.New(color.FgWhite), " Protocol: %s\n", strings.ToUpper(config.ForceProtocol))
+	} else {
+		writer.WriteColor(color.New(color.FgWhite), " Protocol: Auto-detect\n")
+	}
+	if len(config.PathPrefixes) > 0 {
+		writer.WriteColor(color.New(color.FgWhite), " Path Prefixes: %s\n", strings.Join(config.PathPrefixes, ", "))
+		writer.WriteColor(color.New(color.FgWhite), " Base paths: %d | Custom paths: %d\n", stats.BasePaths, stats.CustomPaths)
+	} else {
+		writer.WriteColor(color.New(color.FgWhite), " Path Prefixes: None\n")
+		writer.WriteColor(color.New(color.FgWhite), " Base paths: %d (no custom prefixes)\n", stats.BasePaths)
+	}
+	writer.WriteColor(color.New(color.FgWhite), " Threads: %d\n", config.Threads)
+	if config.OutputFile != "" {
+		writer.WriteColor(color.New(color.FgWhite), " Output: %s\n", config.OutputFile)
+	}
+	if config.DebugMode {
+		writer.WriteColor(color.New(color.FgWhite), " Debug Mode: Enabled\n")
+	}
+	printSeparator('-', writer)
+
+	var domains []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		domain := strings.TrimSpace(scanner.Text())
-		if domain != "" && scanPath(domain) {
-			vulnerableDomains = append(vulnerableDomains, domain)
+		if domain != "" && !strings.HasPrefix(domain, "#") {
+			domains = append(domains, domain)
 		}
 	}
+	if len(domains) == 0 {
+		writer.WriteColor(color.New(color.FgYellow), "No domains found in file\n")
+		return
+	}
+	stats.TotalDomains = len(domains)
+	writer.WriteColor(color.New(color.FgWhite), "Loaded %d domains for scanning...\n", stats.TotalDomains)
 
-	if len(vulnerableDomains) > 0 {
-		color.Green("\n[+] Found %d vulnerable domains:", len(vulnerableDomains))
-		for _, domain := range vulnerableDomains {
-			color.Green("[+] %s", domain)
-		}
-	} else {
-		color.Yellow("\n[+] No vulnerable domains found.")
+	results := make(chan ScanResult, len(domains)*(stats.BasePaths+stats.CustomPaths))
+	semaphore := make(chan struct{}, config.Threads)
+	var wg sync.WaitGroup
+	for _, domain := range domains {
+		wg.Add(1)
+		go func(d string) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			scanDomain(d, &config, results, writer)
+			<-semaphore
+		}(domain)
 	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var vulnerableDomains []ScanResult
+	var criticalDomains []ScanResult
+	var mediumDomains []ScanResult
+	var normalDomains []ScanResult
+
+	for result := range results {
+		if result.Vulnerable {
+			vulnerableDomains = append(vulnerableDomains, result)
+			switch result.SecretLevel {
+			case "CRITICAL":
+				criticalDomains = append(criticalDomains, result)
+			case "MEDIUM":
+				mediumDomains = append(mediumDomains, result)
+			default:
+				normalDomains = append(normalDomains, result)
+			}
+		}
+	}
+	stats.EndTime = time.Now()
+	stats.VulnerableDomains = len(vulnerableDomains)
+	stats.CriticalFindings = len(criticalDomains)
+	stats.MediumFindings = len(mediumDomains)
+	stats.NormalFindings = len(normalDomains)
+
+	printSummary(vulnerableDomains, domains, config, stats, writer)
 }
+
