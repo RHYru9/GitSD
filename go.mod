@@ -1,4 +1,4 @@
-module github.com/rhyru9/gitsd/v2
+module github.com/rhyru9/gitsd
 
 go 1.24.4
 
