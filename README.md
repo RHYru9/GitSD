@@ -19,6 +19,12 @@ A simple, multi-threaded scanner to check for exposed Git repositories on websit
 - Go 1.19 or higher
 - Internet connection for scanning targets
 
+### Quick Install 
+
+```bash
+go install github.com/rhyru9/gitsd@v1.1.0
+```
+
 ### Build from Source
 ```bash
 git clone https://github.com/yourusername/git-scanner-enhanced.git
