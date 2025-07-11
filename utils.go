@@ -73,8 +73,8 @@ func printCentered(text string, writer *OutputWriter, c *color.Color) {
 }
 func printHeader(writer *OutputWriter) {
 	printSeparator('=', writer)
-	printCentered("GIT SCANNER ENHANCED v2.1", writer, color.New(color.FgCyan, color.Bold))
-	printCentered("Advanced Git Exposure & Secret Scanner", writer, color.New(color.FgCyan))
+	printCentered("GIT SCANNER v2.1", writer, color.New(color.FgCyan, color.Bold))
+	printCentered("Advanced Git Exposure & Secret Scanner | Rhyru9", writer, color.New(color.FgCyan))
 	printSeparator('=', writer)
 }
 func isHTML(responseText string) bool {
