@@ -14,6 +14,12 @@ import (
 	"golang.org/x/net/http2"
 )
 
+const (
+	MaxResponseBodySize = 2 << 20  // 2 MB max untuk mencegah DoS
+	MaxRetries          = 2        // Retry untuk koneksi yang gagal
+	RetryDelay          = 1 * time.Second
+)
+
 var standardGitPaths = []string{
 	"/.git/", "/.git/config", "/.git/index", "/.git/logs/", "/.git/HEAD",
 	"/.git/logs/HEAD", "/.git/logs/refs", "/.git/logs/refs/remotes/origin/master",
@@ -22,24 +28,33 @@ var standardGitPaths = []string{
 	"/.git/logs/refs/remotes/origin/main", "/.git/refs/heads/main", "/.git/refs/heads/master",
 	"/.git/refs/remotes/origin/main", "/.git/COMMIT_EDITMSG", "/.git/packed-refs",
 }
+
+var corePaths = []string{
+	"/.git/config",
+	"/.git/HEAD",
+	"/.git/logs/HEAD",
+}
+
 var vulnerabilitySigns = []string{
 	"ref:", "index of", "initial commit", "update by push", "[core]", "repository",
 	"bare = false", "filemode", "[remote", "[branch", "master", "origin", "HEAD branch:",
 	"refs/heads/", "autopull", "repositoryformatversion",
 }
+
 var secretIndicators = []string{
 	"gitlab-ci-token", "x-oauth-basic",
 }
 
 type Config struct {
-	ForceProtocol   string
-	PathPrefixes    []string
-	Filename        string
-	OutputFile      string
-	Threads         int
-	FollowRedirect  bool
-	DebugMode       bool
+	ForceProtocol  string
+	PathPrefixes   []string
+	Filename       string
+	OutputFile     string
+	Threads        int
+	FollowRedirect bool
+	DebugMode      bool
 }
+
 type ScanResult struct {
 	Domain        string
 	Path          string
@@ -52,6 +67,7 @@ type ScanResult struct {
 	Protocol      string
 	IsCustomPath  bool
 }
+
 type ScanStats struct {
 	TotalDomains      int
 	BasePaths         int
@@ -60,19 +76,186 @@ type ScanStats struct {
 	CriticalFindings  int
 	MediumFindings    int
 	NormalFindings    int
+	SkippedDomains    int
 	StartTime         time.Time
 	EndTime           time.Time
+}
+
+type ValidationResult struct {
+	IsAccessible     bool
+	HasVulnerability bool
+	ErrorCount       int
+	ValidResponses   int
+	Reason           string
+}
+
+func readBodySafely(body io.Reader) ([]byte, error) {
+	limitedReader := io.LimitReader(body, MaxResponseBodySize)
+	return io.ReadAll(limitedReader)
+}
+
+func doRequestWithRetry(client *http.Client, req *http.Request, retries int) (*http.Response, error) {
+	var resp *http.Response
+	var err error
+	
+	for attempt := 0; attempt <= retries; attempt++ {
+		// Clone request untuk retry (karena body mungkin sudah di-consume)
+		reqClone := req.Clone(req.Context())
+		
+		resp, err = client.Do(reqClone)
+		
+		// Jika sukses atau bukan error koneksi, return
+		if err == nil {
+			return resp, nil
+		}
+		
+		// Jika masih ada kesempatan retry
+		if attempt < retries {
+			time.Sleep(RetryDelay)
+			continue
+		}
+	}
+	
+	return nil, err
+}
+
+func preScanDomain(domain string, config *Config, client *http.Client, writer *OutputWriter) ValidationResult {
+	result := ValidationResult{
+		IsAccessible:     true,
+		HasVulnerability: false,
+		ErrorCount:       0,
+		ValidResponses:   0,
+	}
+
+	writer.WriteColor(color.New(color.FgHiYellow), " ├─ Pre-scanning core paths...\n")
+
+	for _, path := range corePaths {
+		targetURL := fmt.Sprintf("%s%s", domain, path)
+		
+		req, err := http.NewRequest("GET", targetURL, nil)
+		if err != nil {
+			result.ErrorCount++
+			if config.DebugMode {
+				writer.WriteColor(color.New(color.FgHiBlack), " │  %s → Request creation failed\n", path)
+			}
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; GitScanner/2.1)")
+
+		resp, err := doRequestWithRetry(client, req, 1) // 1 retry untuk pre-scan
+		if err != nil {
+			result.ErrorCount++
+			if config.DebugMode {
+				writer.WriteColor(color.New(color.FgHiBlack), " │  %s → Connection error (after retry)\n", path)
+			}
+			continue
+		}
+
+		func() {
+			defer resp.Body.Close()
+
+			// Deteksi offline berdasarkan status code
+			if resp.StatusCode >= 500 && resp.StatusCode < 600 {
+				result.ErrorCount++
+				if config.DebugMode {
+					writer.WriteColor(color.New(color.FgHiBlack), " │  %s → %d (Server error)\n", path, resp.StatusCode)
+				}
+				return
+			}
+
+			if resp.StatusCode == 200 {
+				bodyBytes, err := readBodySafely(resp.Body)
+				if err != nil {
+					result.ErrorCount++
+					if config.DebugMode {
+						writer.WriteColor(color.New(color.FgRed), " │  %s → Read error: %v\n", path, err)
+					}
+					return
+				}
+
+				content := string(bodyBytes)
+				
+				if isHTML(content) {
+					if config.DebugMode {
+						writer.WriteColor(color.New(color.FgHiBlack), " │  %s → 200 (HTML page, not Git file)\n", path)
+					}
+					return
+				}
+
+				if checkVulnerability(content) {
+					result.ValidResponses++
+					result.HasVulnerability = true
+					if config.DebugMode {
+						writer.WriteColor(color.New(color.FgHiGreen), " │  %s → 200 ✓ VULNERABLE!\n", path)
+					}
+				} else {
+					result.ValidResponses++
+					if config.DebugMode {
+						writer.WriteColor(color.New(color.FgHiBlack), " │  %s → 200 (No vulnerability signs)\n", path)
+					}
+				}
+			} else if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 404 {
+				if config.DebugMode {
+					writer.WriteColor(color.New(color.FgHiBlack), " │  %s → %d\n", path, resp.StatusCode)
+				}
+			}
+		}()
+	}
+
+	totalCorePaths := len(corePaths)
+	
+	// Jika semua path error koneksi → domain offline
+	if result.ErrorCount == totalCorePaths {
+		result.IsAccessible = false
+		result.Reason = "Domain offline or unreachable"
+		return result
+	}
+
+	// Jika mayoritas error koneksi (>= 2 dari 3)
+	if result.ErrorCount >= 2 {
+		result.IsAccessible = false
+		result.Reason = "High connection error rate"
+		return result
+	}
+
+	// Jika tidak ada vulnerability ditemukan di path inti
+	if !result.HasVulnerability {
+		result.Reason = "No vulnerability signs in core paths"
+		return result
+	}
+
+	return result
 }
 
 func scanDomain(domain string, config *Config, results chan<- ScanResult, writer *OutputWriter) {
 	normalizedDomain := normalizeURL(domain, config.ForceProtocol)
 	writer.WriteColor(color.New(color.FgHiCyan, color.Bold), "\n┌─ Scanning: %s\n", normalizedDomain)
+	
 	parsedDomain, err := url.Parse(normalizedDomain)
 	if err != nil {
+		writer.WriteColor(color.New(color.FgRed), "└─ ✗ Invalid URL: %v\n", err)
 		results <- ScanResult{Domain: domain, Error: fmt.Sprintf("Invalid URL: %v", err)}
 		return
 	}
+
 	client := createHTTPClient(config)
+	
+	// Pre-scan validation
+	validation := preScanDomain(normalizedDomain, config, client, writer)
+	
+	// Jika domain tidak accessible atau tidak vulnerable, skip
+	if !validation.IsAccessible {
+		writer.WriteColor(color.New(color.FgHiYellow), "└─ ⚠ SKIPPED: %s\n", validation.Reason)
+		return
+	}
+
+	if !validation.HasVulnerability {
+		writer.WriteColor(color.New(color.FgHiBlack), "└─ ⓘ SKIPPED: %s\n", validation.Reason)
+		return
+	}
+
+	writer.WriteColor(color.New(color.FgHiGreen), " ├─ ✓ Pre-scan passed, running full scan...\n")
+	
 	basePaths, customPaths := buildPaths(config)
 	vulnerableFound := false
 	criticalSecretsFound := false
@@ -82,36 +265,45 @@ func scanDomain(domain string, config *Config, results chan<- ScanResult, writer
 	} else {
 		writer.WriteColor(color.New(color.FgHiWhite), " ├─ Base paths: %d (no custom prefixes)\n", len(basePaths))
 	}
+
 	allPaths := append(basePaths, customPaths...)
+	
 	for i, path := range allPaths {
 		isCustomPath := i >= len(basePaths)
 		targetURL := fmt.Sprintf("%s://%s%s", parsedDomain.Scheme, parsedDomain.Host, path)
+		
 		req, err := http.NewRequest("GET", targetURL, nil)
 		if err != nil {
 			printResult(domain, path, 0, false, "Request creation failed", "NORMAL", nil, "N/A", isCustomPath, writer)
 			continue
 		}
 		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; GitScanner/2.1)")
+
 		resp, err := client.Do(req)
 		if err != nil {
 			printResult(domain, path, 0, false, "Connection failed", "NORMAL", nil, "N/A", isCustomPath, writer)
 			continue
 		}
+
 		func() {
 			defer resp.Body.Close()
+			
 			proto := "HTTP/1.1"
 			if resp.ProtoMajor == 2 {
 				proto = "HTTP/2.0"
 			}
+
 			if resp.StatusCode == 200 {
-				bodyBytes, err := io.ReadAll(resp.Body)
+				bodyBytes, err := readBodySafely(resp.Body)
 				if err != nil {
-					printResult(domain, path, resp.StatusCode, false, "Read error", "NORMAL", nil, proto, isCustomPath, writer)
+					printResult(domain, path, resp.StatusCode, false, "Read error (body too large?)", "NORMAL", nil, proto, isCustomPath, writer)
 					return
 				}
+
 				content := string(bodyBytes)
+				
 				if isHTML(content) {
-					printResult(domain, path, 404, false, "", "NORMAL", nil, proto, isCustomPath, writer)
+					printResult(domain, path, resp.StatusCode, false, "HTML response", "NORMAL", nil, proto, isCustomPath, writer)
 				} else if checkVulnerability(content) {
 					secretLevel, secrets := analyzeSecrets(content, domain)
 					printResult(domain, path, resp.StatusCode, true, "", secretLevel, secrets, proto, isCustomPath, writer)
@@ -131,13 +323,14 @@ func scanDomain(domain string, config *Config, results chan<- ScanResult, writer
 						IsCustomPath:  isCustomPath,
 					}
 				} else {
-					printResult(domain, path, 404, false, "", "NORMAL", nil, proto, isCustomPath, writer)
+					printResult(domain, path, resp.StatusCode, false, "No vulnerability signs", "NORMAL", nil, proto, isCustomPath, writer)
 				}
 			} else {
 				printResult(domain, path, resp.StatusCode, false, "", "NORMAL", nil, proto, isCustomPath, writer)
 			}
 		}()
 	}
+
 	if criticalSecretsFound {
 		writer.WriteColor(color.New(color.FgHiRed, color.Bold), "└─ 🚨 CRITICAL SECRETS FOUND!\n")
 	} else if vulnerableFound {
@@ -156,15 +349,18 @@ func checkVulnerability(content string) bool {
 	}
 	return false
 }
+
 func analyzeSecrets(content, domain string) (string, []string) {
 	var secrets []string
 	secretLevel := "NORMAL"
+
 	ghpRegex := regexp.MustCompile(`ghp_[A-Za-z0-9]{36}`)
 	ghpMatches := ghpRegex.FindAllString(content, -1)
 	for _, match := range ghpMatches {
 		secrets = append(secrets, fmt.Sprintf("GitHub Token: %s", match))
 		secretLevel = "CRITICAL"
 	}
+
 	urlWithCredsRegex := regexp.MustCompile(`url\s*=\s*https?://([^:]+):([^@]+)@([^/\s]+)(/[^\s]*)?`)
 	urlMatches := urlWithCredsRegex.FindAllStringSubmatch(content, -1)
 	for _, match := range urlMatches {
@@ -177,6 +373,7 @@ func analyzeSecrets(content, domain string) (string, []string) {
 				path = match[4]
 			}
 			fullURL := fmt.Sprintf("https://%s:%s@%s%s", username, password, host, path)
+			
 			isCritical := false
 			if strings.Contains(password, "glpat-") {
 				isCritical = true
@@ -197,12 +394,14 @@ func analyzeSecrets(content, domain string) (string, []string) {
 			} else {
 				isCritical = true
 			}
+
 			if isCritical {
 				secretLevel = "CRITICAL"
 				secrets = append(secrets, fmt.Sprintf("CRITICAL Credentials: %s", fullURL))
 			}
 		}
 	}
+
 	contentLower := strings.ToLower(content)
 	for _, indicator := range secretIndicators {
 		if strings.Contains(contentLower, indicator) {
@@ -212,6 +411,7 @@ func analyzeSecrets(content, domain string) (string, []string) {
 			}
 		}
 	}
+
 	githubURLRegex := regexp.MustCompile(`url\s*=\s*(https?://github\.com/[^\s]+)`)
 	githubMatches := githubURLRegex.FindAllStringSubmatch(content, -1)
 	for _, match := range githubMatches {
@@ -231,12 +431,16 @@ func analyzeSecrets(content, domain string) (string, []string) {
 			}
 		}
 	}
+
 	return secretLevel, secrets
 }
+
 func buildPaths(config *Config) ([]string, []string) {
 	var basePaths []string
 	var customPaths []string
+	
 	basePaths = append(basePaths, standardGitPaths...)
+	
 	if len(config.PathPrefixes) > 0 {
 		for _, prefix := range config.PathPrefixes {
 			sanitized := sanitizePrefix(prefix)
@@ -249,10 +453,13 @@ func buildPaths(config *Config) ([]string, []string) {
 			}
 		}
 	}
+	
 	return basePaths, customPaths
 }
+
 func normalizeURL(domain string, forceProtocol string) string {
 	domain = strings.TrimSpace(domain)
+	
 	if forceProtocol != "" {
 		if strings.HasPrefix(domain, "http://") {
 			domain = strings.TrimPrefix(domain, "http://")
@@ -261,28 +468,34 @@ func normalizeURL(domain string, forceProtocol string) string {
 		}
 		return forceProtocol + "://" + domain
 	}
+	
 	if !strings.HasPrefix(domain, "http://") && !strings.HasPrefix(domain, "https://") {
 		domain = "http://" + domain
 	}
+	
 	return domain
 }
+
 func createHTTPClient(config *Config) *http.Client {
 	transport := &http.Transport{
 		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
 		DisableKeepAlives: true,
 	}
+	
 	if strings.Contains(strings.ToLower(config.ForceProtocol), "http2") {
 		http2.ConfigureTransport(transport)
 	} else if strings.Contains(strings.ToLower(config.ForceProtocol), "http1") {
 		transport.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
 	}
+	
 	client := &http.Client{
 		Timeout:   15 * time.Second,
 		Transport: transport,
 	}
+	
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
+	
 	return client
 }
-

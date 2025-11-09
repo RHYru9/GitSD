@@ -75,10 +75,11 @@ func main() {
 	printHeader(writer)
 	basePaths, customPaths := buildPaths(&config)
 	stats := ScanStats{
-		TotalDomains: 0,
-		BasePaths:    len(basePaths),
-		CustomPaths:  len(customPaths),
-		StartTime:    time.Now(),
+		TotalDomains:   0,
+		BasePaths:      len(basePaths),
+		CustomPaths:    len(customPaths),
+		SkippedDomains: 0,
+		StartTime:      time.Now(),
 	}
 
 	writer.WriteColor(color.New(color.FgCyan), "Configuration:\n")
@@ -105,12 +106,25 @@ func main() {
 
 	var domains []string
 	scanner := bufio.NewScanner(file)
+	
+	const maxScanTokenSize = 256 * 1024 // 256 KB
+	buf := make([]byte, maxScanTokenSize)
+	scanner.Buffer(buf, maxScanTokenSize)
+	
+	lineNum := 0
 	for scanner.Scan() {
+		lineNum++
 		domain := strings.TrimSpace(scanner.Text())
 		if domain != "" && !strings.HasPrefix(domain, "#") {
 			domains = append(domains, domain)
 		}
 	}
+	
+	if err := scanner.Err(); err != nil {
+		writer.WriteColor(color.New(color.FgRed), "Error reading file at line %d: %v\n", lineNum, err)
+		writer.WriteColor(color.New(color.FgYellow), "Continuing with %d domains loaded...\n", len(domains))
+	}
+	
 	if len(domains) == 0 {
 		writer.WriteColor(color.New(color.FgYellow), "No domains found in file\n")
 		return
@@ -118,18 +132,49 @@ func main() {
 	stats.TotalDomains = len(domains)
 	writer.WriteColor(color.New(color.FgWhite), "Loaded %d domains for scanning...\n", stats.TotalDomains)
 
-	results := make(chan ScanResult, len(domains)*(stats.BasePaths+stats.CustomPaths))
+	resultsCapacity := stats.TotalDomains * (stats.BasePaths + stats.CustomPaths) / 10 // Asumsi 10% vulnerable
+	if resultsCapacity < 100 {
+		resultsCapacity = 100 // Minimal buffer
+	}
+	if resultsCapacity > 10000 {
+		resultsCapacity = 10000 // Maksimal buffer untuk hemat memori
+	}
+	
+	results := make(chan ScanResult, resultsCapacity)
 	semaphore := make(chan struct{}, config.Threads)
 	var wg sync.WaitGroup
+	
+	var skippedMutex sync.Mutex
+	skippedCount := 0
+	
 	for _, domain := range domains {
 		wg.Add(1)
 		go func(d string) {
 			defer wg.Done()
 			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			
+			// Tangkap panic jika ada (defensive programming)
+			defer func() {
+				if r := recover(); r != nil {
+					writer.WriteColor(color.New(color.FgRed), "\n⚠ PANIC recovered for %s: %v\n", d, r)
+				}
+			}()
+			
+			// Scan domain, jika di-skip increment counter
+			beforeResults := len(results)
 			scanDomain(d, &config, results, writer)
-			<-semaphore
+			afterResults := len(results)
+			
+			// Jika tidak ada hasil baru = domain di-skip
+			if afterResults == beforeResults {
+				skippedMutex.Lock()
+				skippedCount++
+				skippedMutex.Unlock()
+			}
 		}(domain)
 	}
+	
 	go func() {
 		wg.Wait()
 		close(results)
@@ -153,12 +198,13 @@ func main() {
 			}
 		}
 	}
+	
 	stats.EndTime = time.Now()
 	stats.VulnerableDomains = len(vulnerableDomains)
 	stats.CriticalFindings = len(criticalDomains)
 	stats.MediumFindings = len(mediumDomains)
 	stats.NormalFindings = len(normalDomains)
+	stats.SkippedDomains = skippedCount
 
 	printSummary(vulnerableDomains, domains, config, stats, writer)
 }
-

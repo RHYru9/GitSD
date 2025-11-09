@@ -294,9 +294,11 @@ func printSummary(vulnerableDomains []ScanResult, domains []string, config Confi
 	printSeparator('=', writer)
 	printCentered("SCAN SUMMARY", writer, color.New(color.FgCyan, color.Bold))
 	printSeparator('=', writer)
+	
 	resultsByDomain := make(map[string]map[string][]ScanResult)
 	domainMaxSeverity := make(map[string]string)
 	allVulnerableDomains := make(map[string]bool)
+	
 	for _, result := range vulnerableDomains {
 		allVulnerableDomains[result.Domain] = true
 		if _, ok := resultsByDomain[result.Domain]; !ok {
@@ -311,32 +313,51 @@ func printSummary(vulnerableDomains []ScanResult, domains []string, config Confi
 			domainMaxSeverity[result.Domain] = result.SecretLevel
 		}
 	}
+	
 	writer.WriteColor(color.New(color.FgHiGreen, color.Bold), "\n✓ ALL VULNERABLE DOMAINS (%d)\n", len(allVulnerableDomains))
 	printSeparator('-', writer)
 	for domain := range allVulnerableDomains {
 		writer.Write("▶ %s\n", domain)
 	}
+	
 	printCriticalFindings(resultsByDomain, domainMaxSeverity, writer)
 	printMediumFindings(resultsByDomain, domainMaxSeverity, writer)
 	printNormalFindings(resultsByDomain, domainMaxSeverity, writer)
+	
 	printSeparator('=', writer)
 	printCentered("STATISTICS", writer, color.New(color.FgCyan, color.Bold))
 	printSeparator('=', writer)
+	
 	duration := stats.EndTime.Sub(stats.StartTime).Round(time.Second)
+	
 	writer.WriteColor(color.New(color.FgWhite), "Total domains scanned: %d\n", stats.TotalDomains)
+	
+	if stats.SkippedDomains > 0 {
+		writer.WriteColor(color.New(color.FgHiYellow), "Skipped domains: %d ", stats.SkippedDomains)
+		percentage := float64(stats.SkippedDomains) / float64(stats.TotalDomains) * 100
+		writer.WriteColor(color.New(color.FgHiBlack), "(%.1f%%)\n", percentage)
+	}
+	
 	writer.WriteColor(color.New(color.FgHiCyan), "Base paths per domain: %d\n", stats.BasePaths)
 	if stats.CustomPaths > 0 {
 		writer.WriteColor(color.New(color.FgHiCyan), "Custom paths per domain: %d\n", stats.CustomPaths)
 		writer.WriteColor(color.New(color.FgHiCyan), "Total paths per domain: %d\n", stats.BasePaths+stats.CustomPaths)
 	}
+	
 	writer.WriteColor(color.New(color.FgHiGreen), "Vulnerable domains: %d\n", stats.VulnerableDomains)
 	writer.WriteColor(color.New(color.FgHiRed), "Critical severity: %d\n", stats.CriticalFindings)
 	writer.WriteColor(color.New(color.FgHiYellow), "Medium severity: %d\n", stats.MediumFindings)
 	writer.WriteColor(color.New(color.FgGreen), "Standard vulnerabilities: %d\n", stats.NormalFindings)
 	writer.WriteColor(color.New(color.FgHiMagenta), "Scan duration: %s\n", duration)
+	
+	if stats.SkippedDomains > 0 {
+		savedRequests := stats.SkippedDomains * (stats.BasePaths + stats.CustomPaths)
+		writer.WriteColor(color.New(color.FgHiCyan), "Efficiency gain: ~%d requests saved\n", savedRequests)
+	}
+	
 	if config.OutputFile != "" {
 		writer.WriteColor(color.New(color.FgCyan), "\nResults saved to: %s\n", config.OutputFile)
 	}
+	
 	printSeparator('=', writer)
 }
-
